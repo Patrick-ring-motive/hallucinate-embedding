@@ -2,16 +2,30 @@
 
 A tiny Cloudflare Worker that pretends to be an embedding API by asking a language model to generate a deterministic-looking 128-dimensional vector for a given text input.
 
-This project is experimental, weird, and intentionally fake. It does **not** use a real embedding model. Instead, it prompts an LLM to “behave like an embedding model” and return 128 comma-separated floating-point values between `-1` and `1`.
+This project is experimental, weird, and intentionally fake. It does **not** use a real embedding model. Instead, it prompts an LLM to “behave like an embedding model” and return 128 comma-separated floating-point values between `-1` and `1`, then wraps the result in a Cloudflare/OpenAI-compatible `v1/embeddings` response shape.
 
 ## What it does
 
-`hallucinate-embedding` accepts text through either a `GET` query parameter or a raw `POST` body, then returns a JSON array of 128 numbers.
+`hallucinate-embedding` accepts text through either a `GET` query parameter or a `POST` JSON body, then returns a `v1/embeddings`-shaped JSON response containing 128-dimensional vector(s).
 
 Example response:
 
 ```json
-[0.12, -0.44, 0.03, 0.91, ...]
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.12, -0.44, 0.03, 0.91, "... 128 values total"]
+    }
+  ],
+  "model": "fake-embed",
+  "usage": {
+    "prompt_tokens": 3,
+    "total_tokens": 3
+  }
+}
 ```
 
 The Worker:
@@ -22,7 +36,7 @@ The Worker:
 https://best-model.api-cloud-flare.workers.dev/
 ```
 
-2. Sends the input text to Cloudflare Workers AI using `env.AI.run`.
+2. Sends the input text (or each input in a batch) to Cloudflare Workers AI using `env.AI.run`.
 
 3. Prompts the model to output exactly 128 floats.
 
@@ -30,51 +44,93 @@ https://best-model.api-cloud-flare.workers.dev/
 
 5. Pads missing values with `0` if fewer than 128 numbers are returned.
 
+6. Wraps each vector into a `v1/embeddings`-compatible response object.
+
 ## API
+
+Response shape is the same for both methods — see [Response](#response) below.
 
 ### GET
 
+Single input only (query string). Accepts `input` (preferred) or `text` (legacy alias).
+
 ```http
-GET /?text=hello%20world
+GET /?input=hello%20world
 ```
 
 Example:
 
 ```bash
-curl "https://your-worker.your-subdomain.workers.dev/?text=hello%20world"
+curl "https://your-worker.your-subdomain.workers.dev/?input=hello%20world"
+```
+
+Optional `model` override:
+
+```bash
+curl "https://your-worker.your-subdomain.workers.dev/?input=hello%20world&model=my-label"
 ```
 
 ### POST
 
+JSON body, matches OpenAI/Cloudflare `v1/embeddings` request shape. `input` can be a single string or an array of strings (batch).
+
 ```http
 POST /
-Content-Type: text/plain
+Content-Type: application/json
 
-hello world
+{ "input": "hello world" }
+```
+
+Batch example:
+
+```http
+POST /
+Content-Type: application/json
+
+{ "input": ["hello world", "goodbye world"] }
 ```
 
 Example:
 
 ```bash
 curl -X POST "https://your-worker.your-subdomain.workers.dev/" \
-  -H "Content-Type: text/plain" \
-  --data "hello world"
+  -H "Content-Type: application/json" \
+  -d '{"input": ["hello world", "goodbye world"]}'
 ```
 
 ## Response
 
-The API returns a JSON array with exactly 128 numeric values.
+The API returns a JSON object matching the OpenAI/Cloudflare `v1/embeddings` schema:
 
 ```json
-[
-  0.104,
-  -0.218,
-  0.441,
-  0.002
-]
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.104, -0.218, "... 128 total"] },
+    { "object": "embedding", "index": 1, "embedding": [0.301, 0.009, "... 128 total"] }
+  ],
+  "model": "fake-embed",
+  "usage": {
+    "prompt_tokens": 6,
+    "total_tokens": 6
+  }
+}
 ```
 
-Actual responses contain 128 elements.
+Each `data[].embedding` array contains exactly 128 numeric values. `data[].index` matches the position of the corresponding input. `usage` token counts are a rough character-based estimate, not a real tokenizer — this Worker has no way to know the target model's actual tokenization.
+
+### Errors
+
+Malformed or missing input returns a standard error shape with an appropriate HTTP status:
+
+```json
+{
+  "error": {
+    "message": "'input' is required",
+    "type": "invalid_request_error"
+  }
+}
+```
 
 ## Why?
 
@@ -124,6 +180,8 @@ If the model returns fewer than 128 values, the Worker fills the remaining dimen
 const arr = Array(128).fill(0).map((_, i) => vec[i] || 0);
 ```
 
+For `POST` requests with multiple `input` strings, each string is embedded independently (in parallel) and returned as a separate `data[]` entry, indexed in input order.
+
 ## Cloudflare setup
 
 This Worker expects a Cloudflare Workers AI binding named `AI`.
@@ -152,7 +210,7 @@ import { env } from "cloudflare:workers";
 
 const getModel = async () => {
   try {
-    const res = await fetch("https://best-model.api-cloud-flare.workers.dev/");
+    const res = await fetch('https://best-model.api-cloud-flare.workers.dev/');
     const data = await res.json();
     return data.model;
   } catch (e) {
@@ -161,86 +219,105 @@ const getModel = async () => {
 };
 
 const getVec = async (model, text) => {
+  const sys = "you behave like and embedding model and return a vector representing the semantic value of provided text. Output exactly 128 floats, range -1 to 1, comma-separated, no words, no explanation. Represent semantic content of input as numbers deterministically.";
   try {
     const resp = await env.AI.run(model, {
       messages: [
-        {
-          role: "system",
-          content:
-            "you behave like and embedding model and return a vector representing the semantic value of provided text. Output exactly 128 floats, range -1 to 1, comma-separated, no words, no explanation. Represent semantic content of input as numbers deterministically."
-        },
+        { role: "system", content: sys },
         { role: "user", content: text }
       ],
       temperature: 0,
       seed: 42
     });
-
     return resp.response.trim();
   } catch (e) {
     try {
       const resp = await env.AI.run(model, {
         messages: [
-          {
-            role: "system",
-            content:
-              "you behave like and embedding model and return a vector representing the semantic value of provided text. Output exactly 128 floats, range -1 to 1, comma-separated, no words, no explanation. Represent semantic content of input as numbers deterministically."
-          },
-          {
-            role: "user",
-            content: [...new Set(text.split(/\s+/))].join(" ")
-          }
+          { role: "system", content: sys },
+          { role: "user", content: [...new Set(text.split(/\s+/))].join(' ') }
         ],
         temperature: 0,
         seed: 42
       });
-
       return resp.response.trim();
-    } catch (e) {
-      return String(e);
+    } catch (e2) {
+      return String(e2);
     }
   }
 };
 
 let model;
-
 async function fakeEmbed(text) {
   if (!model) {
     model = getModel();
   }
-
   model = await model;
-
   const raw = await getVec(model, text);
   const vec = raw.split(",").map(Number);
-  const arr = Array(128)
-    .fill(0)
-    .map((_, i) => vec[i] || 0);
-
+  const arr = Array(128).fill(0).map((_, i) => vec[i] || 0);
   return arr;
+}
+
+const estTokens = (s) => Math.ceil(s.length / 4);
+
+function errResp(msg, status) {
+  return new Response(JSON.stringify({
+    error: { message: msg, type: "invalid_request_error" }
+  }), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+function buildResult(inputs, embeddings, modelName) {
+  const totalTokens = inputs.reduce((sum, t) => sum + estTokens(String(t)), 0);
+  return {
+    object: "list",
+    data: embeddings.map((embedding, index) => ({
+      object: "embedding",
+      index,
+      embedding
+    })),
+    model: modelName || "fake-embed",
+    usage: {
+      prompt_tokens: totalTokens,
+      total_tokens: totalTokens
+    }
+  };
 }
 
 export default {
   async fetch(request) {
-    let text;
+    let inputs, reqModel;
 
-    try {
-      if (request.method === "GET") {
-        text = new URL(request.url).searchParams.get("text");
-      } else {
-        text = await request.text();
+    if (request.method === 'GET') {
+      const url = new URL(request.url);
+      const text = url.searchParams.get('input') ?? url.searchParams.get('text');
+      reqModel = url.searchParams.get('model');
+      if (!text) return errResp("'input' query param required", 400);
+      inputs = [text];
+    } else if (request.method === 'POST') {
+      let body;
+      try {
+        body = await request.json();
+      } catch (e) {
+        return errResp("Invalid JSON body", 400);
       }
-    } catch (e) {
-      text = String(e);
+      const { input, model: m } = body;
+      reqModel = m;
+      if (!input || (Array.isArray(input) && input.length === 0)) {
+        return errResp("'input' is required", 400);
+      }
+      inputs = Array.isArray(input) ? input : [input];
+    } else {
+      return errResp("Method not allowed, use GET or POST", 405);
     }
 
-    const result = await fakeEmbed(text);
+    const embeddings = await Promise.all(inputs.map(text => fakeEmbed(String(text))));
+    const result = buildResult(inputs, embeddings, reqModel);
 
     return new Response(JSON.stringify(result), {
-      headers: {
-        "Content-Type": "application/json"
-      }
+      headers: { 'Content-Type': 'application/json' }
     });
-  }
+  },
 };
 ```
 
@@ -255,7 +332,9 @@ Known limitations:
 * Empty input may still produce a vector.
 * The output may not be meaningfully comparable across requests.
 * The selected model depends on an external endpoint.
-* The returned vector is only as reliable as the model’s compliance with the prompt.
+* The returned vector is only as reliable as the model's compliance with the prompt.
+* `usage` token counts are a character-based estimate, not real tokenization.
+* `GET` requests support only a single input string, not batching.
 
 ## License
 
