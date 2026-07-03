@@ -1,4 +1,6 @@
-import { env } from "cloudflare:workers";
+import {
+  env
+} from "cloudflare:workers";
 
 const getModel = async () => {
   try {
@@ -14,9 +16,14 @@ const getVec = async (model, text) => {
   const sys = "you behave like and embedding model and return a vector representing the semantic value of provided text. Output exactly 128 floats, range -1 to 1, comma-separated, no words, no explanation. Represent semantic content of input as numbers deterministically.";
   try {
     const resp = await env.AI.run(model, {
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: text }
+      messages: [{
+          role: "system",
+          content: sys
+        },
+        {
+          role: "user",
+          content: text
+        }
       ],
       temperature: 0,
       seed: 42
@@ -25,9 +32,14 @@ const getVec = async (model, text) => {
   } catch (e) {
     try {
       const resp = await env.AI.run(model, {
-        messages: [
-          { role: "system", content: sys },
-          { role: "user", content: [...new Set(text.split(/\s+/))].join(' ') }
+        messages: [{
+            role: "system",
+            content: sys
+          },
+          {
+            role: "user",
+            content: [...new Set(text.split(/\s+/))].join(' ')
+          }
         ],
         temperature: 0,
         seed: 42
@@ -55,8 +67,16 @@ const estTokens = (s) => Math.ceil(s.length / 4);
 
 function errResp(msg, status) {
   return new Response(JSON.stringify({
-    error: { message: msg, type: "invalid_request_error" }
-  }), { status, headers: { 'Content-Type': 'application/json' } });
+    error: {
+      message: msg,
+      type: "invalid_request_error"
+    }
+  }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
 }
 
 function buildResult(inputs, embeddings, modelName) {
@@ -93,7 +113,10 @@ export default {
       } catch (e) {
         return errResp("Invalid JSON body", 400);
       }
-      const { input, model: m } = body;
+      const {
+        input,
+        model: m
+      } = body;
       reqModel = m;
       if (!input || (Array.isArray(input) && input.length === 0)) {
         return errResp("'input' is required", 400);
@@ -107,7 +130,9 @@ export default {
     const result = buildResult(inputs, embeddings, reqModel);
 
     return new Response(JSON.stringify(result), {
-      headers: { 'Content-Type': 'application/json' }
+      headers: {
+        'Content-Type': 'application/json'
+      }
     });
   },
 };
